@@ -1,75 +1,69 @@
-import os, sys, time, math, argparse, itertools, random, warnings
+import os, time, argparse, itertools, warnings
 from typing import List
+
 import torch
 import torch.nn as nn
 import torch.distributed.rpc as rpc
 import torch.distributed.autograd as dist_autograd
 import torch.distributed.optim as dist_optim
-from torch.utils.data import DataLoader, TensorDataset
 from torchvision.models import resnet18
 import matplotlib.pyplot as plt
 
+warnings.filterwarnings("ignore", category=UserWarning)
 
-# ============ 公共工具 ============
+START_T = time.time()
+
+
 def log(msg, rank):
-    elapsed = f"{time.time()-START_T:.3f}s"
-    print(f"[{elapsed}] rank{rank}: {msg}", flush=True)
+    print(f"[{time.time()-START_T:6.3f}s] rank{rank}: {msg}", flush=True)
 
 
-def synthetic_loader(batch, total_batches, device):
-    """用随机数据代替真实数据，避免下载数据集耗时。"""
+# ---------- 数据 ----------
+def synthetic_loader(batch: int, total_batches: int, device: str):
     for _ in range(total_batches):
         x = torch.randn(batch, 3, 224, 224, device=device)
         y = torch.randint(0, 1000, (batch,), device=device)
         yield x, y
 
 
+# ---------- 模型切分 ----------
 def split_resnet18() -> List[nn.Module]:
-    """按层拆 ResNet18 -> 两段（可自行增减）"""
     full = resnet18(num_classes=1000)
-    # 第一段：conv1 ~ layer2
     stage0 = nn.Sequential(
         full.conv1, full.bn1, full.relu, full.maxpool, full.layer1, full.layer2
     )
-    # 第二段：layer3+layer4+fc
     stage1 = nn.Sequential(
         full.layer3, full.layer4, full.avgpool, nn.Flatten(1), full.fc
     )
     return [stage0, stage1]
 
 
-# ============ Stage 定义 ============
+# ---------- 远程 Stage ----------
 class Stage(nn.Module):
-    """每个 rank 上真正跑的子模块"""
-
-    def __init__(self, submod: nn.Module):
+    def __init__(self, sub: nn.Module):
         super().__init__()
-        self.sub = submod.to(torch.cuda.current_device())
+        self.device = torch.cuda.current_device()
+        self.sub = sub.to(self.device)
 
     def forward(self, x):
-        return self.sub(x)
+        x = x.to(self.device, non_blocking=True)
+        y = self.sub(x)
+        return y.cpu()  # 传回 Driver / 下一段
 
     def parameter_rrefs(self):
         return [rpc.RRef(p) for p in self.sub.parameters()]
 
 
-# ============ Pipeline Driver ============
+# ---------- Driver ----------
 class PipelineDriver:
-    """
-    rank0 作为 driver：
-    - 拆 batch 为 chunks
-    - 串起远程阶段，形成流水线
-    """
-
     def __init__(self, workers: List[str], chunks: int):
-        self.workers = workers  # worker0, worker1, ...
+        self.workers = workers
         self.chunks = chunks
-        # 远程创建 Stage
-        self.stage_rrefs = []
+
         stages = split_resnet18()
-        for w, sub in zip(workers, stages):
-            self.stage_rrefs.append(rpc.remote(w, Stage, args=(sub,)))
-        # 收集全部参数 RRef，供分布式优化器使用
+        self.stage_rrefs = [
+            rpc.remote(w, Stage, args=(sub,)) for w, sub in zip(workers, stages)
+        ]
         self.param_rrefs = list(
             itertools.chain.from_iterable(
                 s.rpc_sync().parameter_rrefs() for s in self.stage_rrefs
@@ -80,39 +74,27 @@ class PipelineDriver:
             torch.optim.SGD, self.param_rrefs, lr=0.05, momentum=0.9
         )
 
-    def _run_microbatch(self, mb_x):
-        """
-        异步串联调用每个 stage；返回 Future
-        """
-        fut = self.stage_rrefs[0].rpc_async().forward(mb_x)
-
-        # 链式 then，形成流水
-        for next_stage in self.stage_rrefs[1:]:
-            fut = fut.then(
-                lambda prev_fut, r=next_stage:
-                    r.rpc_async().forward(prev_fut.wait())
-            )
-        return fut.then(lambda last_fut: last_fut.wait())
+    # 异步流水一个 micro-batch
+    def _run_microbatch(self, mb_x: torch.Tensor):
+        fut = self.stage_rrefs[0].rpc_async().forward(mb_x.cpu())
+        for nxt in self.stage_rrefs[1:]:
+            fut = fut.then(lambda pf, r=nxt: r.rpc_async().forward(pf.wait()))
+        return fut.then(lambda lf: lf.wait())  # 返回 Tensor
 
     def train_epoch(self, loader, rank):
         total_loss, total = 0.0, 0
-        for i, (x, y) in enumerate(loader):
-            micro_size = x.size(0) // self.chunks
+        for step, (x, y) in enumerate(loader):
+            mb_sz = x.size(0) // self.chunks
             micro_x = x.chunk(self.chunks)
             micro_y = y.chunk(self.chunks)
 
             with dist_autograd.context() as ctx:
-                # ---- 前向：并发发射每个 microbatch ----
-                futures = []
-                for mb in micro_x:
-                    futures.append(self._run_microbatch(mb))
+                futures = [self._run_microbatch(mb) for mb in micro_x]
+                outs_gpu = [f.wait().cuda() for f in futures]
+                tgt_gpu = [t.cuda() for t in micro_y]
 
-                # 同步等待全部输出
-                outs = [f.wait() for f in futures]
-
-                # ---- 计算 loss & 反向 ----
                 loss = torch.stack(
-                    [self.criterion(o, t) for o, t in zip(outs, micro_y)]
+                    [self.criterion(o, t) for o, t in zip(outs_gpu, tgt_gpu)]
                 ).mean()
 
                 dist_autograd.backward(ctx, [loss])
@@ -120,152 +102,102 @@ class PipelineDriver:
 
             total_loss += loss.item() * x.size(0)
             total += x.size(0)
-            if i % 10 == 0:
-                log(
-                    f"epoch progress {i}/{len(loader)} "
-                    f"avg_loss={total_loss/total:.3f}",
-                    rank,
-                )
+            if step % 10 == 0:
+                log(f"step {step}  avg_loss={total_loss/total:.3f}", rank)
         return total_loss / total
 
 
-# ============ 单 GPU 训练 ============
+# ---------- 单机基准 ----------
 def single_gpu_train(args):
     torch.cuda.set_device(0)
     device = "cuda:0"
     model = resnet18(num_classes=1000).to(device)
     opt = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
-    criterion = nn.CrossEntropyLoss()
+    crit = nn.CrossEntropyLoss()
 
-    batches_per_epoch = args.iters
+    batches = args.iters
     tic = time.time()
-
     for ep in range(args.epochs):
-        loader = synthetic_loader(args.batch, batches_per_epoch, device)
-
-        total_loss, total = 0.0, 0
-
-        for i, (x, y) in enumerate(loader):
+        loader = synthetic_loader(args.batch, batches, device)
+        tot, tot_loss = 0, 0.0
+        for stp, (x, y) in enumerate(loader):
             out = model(x)
-            loss = criterion(out, y)
+            loss = crit(out, y)
             loss.backward()
             opt.step()
             model.zero_grad(set_to_none=True)
-            total_loss += loss.item() * x.size(0)
-            total += x.size(0)
 
-            if i % 10 == 0:
-                print(
-                    f"[{time.time()-tic:.2f}s] single epoch "
-                    f"{ep} step {i}/{batches_per_epoch}"
-                )
-
-        avg = total_loss / total
-        print(f"epoch {ep} avg_loss={avg:.3f}")
-
+            tot_loss += loss.item() * x.size(0)
+            tot += x.size(0)
+            if stp % 10 == 0:
+                log(f"single epoch{ep} step{stp}", 0)
+        print(f"epoch {ep} avg_loss={tot_loss/tot:.3f}")
     elapsed = time.time() - tic
-    print(f"=== single-gpu total time: {elapsed:.2f}s ===")
+    print(f"=== single-gpu total {elapsed:.2f}s ===")
     return elapsed
 
 
-# ============ Pipeline 主函数 ============
+# ---------- 可视化 ----------
+def visualize(t_single, t_pipe, gpus):
+    acc = t_single / t_pipe
+    fig, ax = plt.subplots(figsize=(4, 3))
+    ax.bar(["single"], [t_single])
+    ax.bar([f"{gpus}-gpu\npipe"], [t_pipe])
+    ax.set_ylabel("seconds  (lower is better)")
+    ax.set_title(f"speed-up {acc:.2f}×")
+    for i, v in enumerate([t_single, t_pipe]):
+        ax.text(i, v * 1.02, f"{v:.1f}s", ha="center")
+    plt.tight_layout()
+    plt.savefig("speedup.png")
+    print("saved speedup.png")
+
+
+# ---------- Pipeline 主程 ----------
 def run_pipeline(args):
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank % torch.cuda.device_count())
 
-    # worker 名称，便于 rpc(remote)
-    worker_name = f"worker{rank}"
-    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=128)
-    rpc.init_rpc(worker_name, rank=rank, world_size=world, rpc_backend_options=options)
-
+    rpc_opts = rpc.TensorPipeRpcBackendOptions(num_worker_threads=128)
+    rpc.init_rpc(
+        f"worker{rank}", rank=rank, world_size=world, rpc_backend_options=rpc_opts
+    )
     log("rpc initialized", rank)
 
-    # rank0 driver
     if rank == 0:
-        # 构造流水线
         workers = [f"worker{r}" for r in range(world)]
         driver = PipelineDriver(workers, args.chunks)
 
-        batches_per_epoch = args.iters
-        loader = synthetic_loader(args.batch, batches_per_epoch, device="cuda:0")
-
+        loader = synthetic_loader(args.batch, args.iters, device="cuda:0")
         tic = time.time()
         for ep in range(args.epochs):
             loss = driver.train_epoch(loader, rank)
-            log(f"epoch {ep} finished, loss={loss:.3f}", rank)
-        elapsed = time.time() - tic
-        log(f"=== pipeline total time: {elapsed:.2f}s ===", rank)
+            log(f"epoch {ep} done  loss={loss:.3f}", rank)
+        t_pipe = time.time() - tic
+        log(f"=== pipeline total {t_pipe:.2f}s ===", rank)
 
-        # 可视化对比（与基准单卡时间一起画）
         if args.single_time:
-            visualize(args.single_time, elapsed, world)
-    # 其余 rank 仅保持 rpc 运行
+            visualize(args.single_time, t_pipe, world)
     rpc.shutdown()
 
 
-# ============ 可视化 ============
-def visualize(t_single, t_pipeline, gpus):
-    accel = t_single / t_pipeline
-    fig, ax = plt.subplots(figsize=(5, 4))
-    ax.bar(["single"], [t_single])
-    ax.bar([f"{gpus}-gpu\npipeline"], [t_pipeline])
-    ax.set_ylabel("Time / s  (lower is better)")
-    ax.set_title(f"Speed-up = {accel:.2f}×")
-    for i, v in enumerate([t_single, t_pipeline]):
-        ax.text(i, v * 1.01, f"{v:.1f}s", ha="center")
-    plt.tight_layout()
-    plt.savefig("speedup.png")
-    print("figure saved: speedup.png")
-
-
-# ============ CLI ============
-START_T = time.time()
-
-
+# ---------- CLI ----------
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["pipeline", "single"], default="single")
-    p.add_argument("--epochs", type=int, default=2)
-    p.add_argument(
-        "--batch", type=int, default=64, help="global batch (会被 driver 均分为 chunks)"
-    )
-    p.add_argument("--chunks", type=int, default=4, help="micro-batch 个数")
-    p.add_argument(
-        "--iters", type=int, default=40, help="batches per epoch (synthetic)"
-    )
-    p.add_argument(
-        "--single_time",
-        type=float,
-        default=None,
-        help="基准单卡耗时（由单卡跑完后手动填入即可绘图）",
-    )
-    args = p.parse_args()
+    pa = argparse.ArgumentParser()
+    pa.add_argument("--mode", choices=["single", "pipeline"], default="single")
+    pa.add_argument("--epochs", type=int, default=2)
+    pa.add_argument("--batch", type=int, default=64)
+    pa.add_argument("--chunks", type=int, default=4)
+    pa.add_argument("--iters", type=int, default=40)
+    pa.add_argument("--single_time", type=float, default=None)
+    args = pa.parse_args()
 
     if args.mode == "single":
         t = single_gpu_train(args)
-        print("将此数值作为 --single_time 传给 pipeline 模式 " "即可绘制加速图。")
+        print("将该用时填入 --single_time 以绘制加速图")
     else:
         run_pipeline(args)
 
 
 if __name__ == "__main__":
     main()
-
-"""
-# ---- 多机多卡启动示例（2 节点 × 1 GPU）----
-# 节点 A（master）：
-MASTER_ADDR=<master_ip>
-MASTER_PORT=29500
-torchrun --nnodes=2 --nproc_per_node=1 --node_rank=0 \
-    resnet_pipeline.py --mode pipeline --epochs 5 --batch 128 --chunks 4
-
-# 节点 B（worker）：
-MASTER_ADDR=<master_ip>
-MASTER_PORT=29500
-torchrun --nnodes=2 --nproc_per_node=1 --node_rank=1 \
-    resnet_pipeline.py --mode pipeline --epochs 5 --batch 128 --chunks 4
-
-# ---- 单机单卡基准 ----
-python resnet_pipeline.py --mode single --epochs 5 --batch 128
-"""
