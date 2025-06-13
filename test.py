@@ -248,15 +248,15 @@ def main():
                        help='Training mode: pipeline or single GPU')
     parser.add_argument('--batch-size', type=int, default=64,
                        help='Input batch size')
-    parser.add_argument('--epochs', type=int, default=3,
+    parser.add_argument('--epochs', type=int, default=30,
                        help='Number of epochs to train')
     parser.add_argument('--master-addr', default='localhost',
                        help='Master address for distributed training')
     parser.add_argument('--master-port', default='29500',
                        help='Master port for distributed training')
-    parser.add_argument('--nodes', type=int, default=1,
+    parser.add_argument('--nodes', type=int, default=2,
                        help='Number of nodes')
-    parser.add_argument('--gpus', type=int, default=4,
+    parser.add_argument('--gpus', type=int, default=1,
                        help='Number of GPUs per node')
     args = parser.parse_args()
 
@@ -310,5 +310,4 @@ def run_comparison():
     visualize_results(pipeline_results, single_results)
 
 if __name__ == '__main__':
-    # 直接运行对比实验
-    run_comparison()
+    main()
