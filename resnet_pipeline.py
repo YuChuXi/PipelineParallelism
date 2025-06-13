@@ -88,8 +88,11 @@ class PipelineDriver:
 
         # 链式 then，形成流水
         for next_stage in self.stage_rrefs[1:]:
-            fut = fut.then(lambda y, r=next_stage: r.rpc_async().forward(y))
-        return fut
+            fut = fut.then(
+                lambda prev_fut, r=next_stage:
+                    r.rpc_async().forward(prev_fut.wait())
+            )
+        return fut.then(lambda last_fut: last_fut.wait())
 
     def train_epoch(self, loader, rank):
         total_loss, total = 0.0, 0
