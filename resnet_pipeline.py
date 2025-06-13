@@ -50,45 +50,39 @@ class Stage(nn.Module):
 
 # ---------- Driver ----------
 class PipelineDriver:
-    def __init__(self, workers: List[str], chunks: int):
+    def __init__(self, workers, chunks):
         self.chunks = chunks
-        self.stage_rrefs = [
-            rpc.remote(w, Stage, (s,)) for w, s in zip(workers, split_resnet18())
-        ]
-        self.param_rrefs = list(
-            itertools.chain.from_iterable(
-                s.rpc_sync().parameter_rrefs() for s in self.stage_rrefs
-            )
-        )
+        self.stage_rrefs = [rpc.remote(w, Stage, (s,))
+                            for w, s in zip(workers, split_resnet18())]
+        self.param_rrefs = list(itertools.chain.from_iterable(
+            s.rpc_sync().parameter_rrefs() for s in self.stage_rrefs))
         self.crit = nn.CrossEntropyLoss()
         self.opt = dist_optim.DistributedOptimizer(
-            torch.optim.SGD, self.param_rrefs, lr=0.05, momentum=0.9
-        )
+            torch.optim.SGD, self.param_rrefs, lr=0.05, momentum=0.9)
 
-    # ---- 运行 1 个 micro-batch，返回 *Future[Tensor]* ----
-    def _launch_one(self, mb: torch.Tensor):
+    def _launch_one(self, mb):
+        """发射一个 micro-batch，返回 Future[Tensor]"""
         fut = self.stage_rrefs[0].rpc_async().forward(mb.cpu())
         for nxt in self.stage_rrefs[1:]:
-            # flatten: wait 前一段结果，再异步发给下一段，返回 Future[Tensor]
-            fut = fut.then(lambda t, r=nxt: r.rpc_async().forward(t).wait())
-        return fut  # 最外层已是 tensor future
+            # 回调拿到上一段结果 tensor → 同步调用下一段 → 返回 tensor
+            fut = fut.then(lambda t, r=nxt: r.rpc_sync().forward(t))
+        return fut                                # 最终仍是 Future[Tensor]
 
     def train_epoch(self, loader, rank):
-        tot_loss, tot = 0.0, 0
+        tot_loss = tot = 0
         for step, (x, y) in enumerate(loader):
             micro_x, micro_y = x.chunk(self.chunks), y.chunk(self.chunks)
             with dist_autograd.context() as ctx:
                 futs = [self._launch_one(mb) for mb in micro_x]
-                outs = [f.wait().cuda() for f in futs]  # 都是 Tensor
+                outs = [f.wait().cuda() for f in futs]
                 tgts = [t.cuda() for t in micro_y]
                 loss = torch.stack([self.crit(o, t) for o, t in zip(outs, tgts)]).mean()
-                dist_autograd.backward(ctx, [loss])
-                self.opt.step(ctx)
-            tot_loss += loss.item() * x.size(0)
-            tot += x.size(0)
+                dist_autograd.backward(ctx, [loss]); self.opt.step(ctx)
+            tot_loss += loss.item() * x.size(0); tot += x.size(0)
             if step % 10 == 0:
-                log(f"step{step}  loss={tot_loss/tot:.3f}", rank)
+                log(f"step {step}  loss={tot_loss / tot:.3f}", rank)
         return tot_loss / tot
+
 
 
 # ---------- 单机基准 ----------
