@@ -1,411 +1,314 @@
-# -*- coding: utf-8 -*-
-import argparse
 import os
 import time
+import logging
+import argparse
 import torch
 import torch.nn as nn
-from torchvision.models import resnet50
-import torch.distributed.rpc as rpc
-from torch.distributed.rpc import RRef
-import torch.distributed.autograd as dist_autograd
-from torch.distributed.optim import DistributedOptimizer
-import torch.optim as optim
-from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, Dataset
+from torchvision.models.resnet import ResNet, BasicBlock
+import matplotlib.pyplot as plt
+import numpy as np
 
+# 配置日志格式
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger()
 
-# --- 1. 模型定义与切分 ---
-# 将ResNet-50模型切分为多个部分，以适应流水线并行的需求
-# world_size: GPU总数
-def get_resnet_split(world_size):
-    """
-    将 torchvision 的 ResNet-50 模型切分成 world_size 个部分。
-    """
-    model = resnet50(weights=None) # 不加载预训练权重以避免网络下载
-    
-    # 为了演示，我们手动将模型切分为几个nn.Sequential块
-    # 在实际应用中，你可能需要更智能的切分策略来平衡各部分计算量
-    splits = []
-    if world_size == 1:
-        return [model]
-    if world_size == 2:
-        splits.append(nn.Sequential(
-            model.conv1, model.bn1, model.relu, model.maxpool, model.layer1, model.layer2
-        ))
-        splits.append(nn.Sequential(
-            model.layer3, model.layer4, model.avgpool, nn.Flatten(), model.fc
-        ))
-    elif world_size == 4:
-        splits.append(nn.Sequential(
-            model.conv1, model.bn1, model.relu, model.maxpool, model.layer1
-        ))
-        splits.append(model.layer2)
-        splits.append(model.layer3)
-        splits.append(nn.Sequential(
-            model.layer4, model.avgpool, nn.Flatten(), model.fc
-        ))
-    else:
-        raise ValueError(f"不支持 world_size={world_size} 的自动切分，请为2或4，或手动实现切分逻辑。")
-
-    print(f"模型被成功切分为 {len(splits)} 部分，用于 {world_size} 卡流水线。")
-    return splits
-
-# --- 2. 流水线并行模块 ---
-# 这个类封装了流水线并行的核心逻辑
-class PipeModule(nn.Module):
-    def __init__(self, model_parts, device, micro_batches):
-        super().__init__()
-        self.parts = []
-        # 将模型的每个部分注册为子模块并移动到指定设备
-        for i, part in enumerate(model_parts):
-            self.parts.append(part.to(device))
-            self.add_module(f"part_{i}", self.parts[i])
-
-        self.rank = rpc.get_worker_info().id
-        self.world_size = len(model_parts)
-        self.device = device
-        self.micro_batches = micro_batches
-        self.loss_fn = nn.CrossEntropyLoss()
+# 自定义数据集类
+class SyntheticDataset(Dataset):
+    def __init__(self, num_samples=1000, image_size=(3, 224, 224), num_classes=10):
+        self.num_samples = num_samples
+        self.image_size = image_size
+        self.num_classes = num_classes
         
-        # 用于形象化日志输出
-        self.start_time = time.time()
-        self.log_prefix = f"[T=%.2f] [GPU {self.rank}]"
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        image = torch.randn(*self.image_size)
+        label = torch.randint(0, self.num_classes, (1,)).item()
+        return image, label
 
-    def _log(self, msg):
-        current_time = time.time() - self.start_time
-        print(self.log_prefix % current_time + " " + msg)
-
-    def forward(self, x_rref, y_rref):
-        # 从RRef (Remote Reference)中获取真实的输入数据和标签
-        # 只有rank 0会接收到真实的输入，其他rank接收的是中间激活
-        if self.rank == 0:
-            inputs = x_rref.to_local().to(self.device)
-            labels = y_rref.to_local().to(self.device)
-            # 将一个大batch切分为多个micro-batch
-            micro_inputs = torch.chunk(inputs, self.micro_batches, dim=0)
-        else:
-            labels = y_rref.to_local().to(self.device)
-            micro_labels = torch.chunk(labels, self.micro_batches, dim=0)
-
-        # 流水线核心逻辑
-        # 使用 RRef 来持有对下一阶段输入的引用
-        remote_inputs_rrefs = []
+# 拆分ResNet模型
+class PipelineResNet(ResNet):
+    def __init__(self, stages, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stages = nn.ModuleList(stages)
         
-        # 预热阶段 (Warm-up)
-        # 填充流水线
-        for i in range(self.world_size - 1 - self.rank):
-            if self.rank == 0:
-                x = micro_inputs[i]
-            else:
-                # 从上一级获取中间激活
-                x_rref = remote_inputs_rrefs.pop(0) if remote_inputs_rrefs else x_rref
-                self._log(f"开始 FWD (micro-batch {i}) - 接收数据")
-                x = x_rref.to_local()
-                self._log(f"完成 FWD (micro-batch {i}) - 接收数据")
-
-            self._log(f"开始 FWD (micro-batch {i}) - 计算")
-            out = self.parts[self.rank](x)
-            self._log(f"完成 FWD (micro-batch {i}) - 计算")
-            
-            # 将中间结果通过RPC发送到下一个rank
-            next_rank = (self.rank + 1) % self.world_size
-            self._log(f"开始 FWD (micro-batch {i}) - 发送到 GPU {next_rank}")
-            remote_out_rref = rpc.remote(f"worker{next_rank}", lambda x: x, args=(out,))
-            
-            if self.rank < self.world_size - 2:
-                # 如果不是倒数第二级，将下一级的输入RRef传递给下一级
-                rpc.rpc_async(f"worker{next_rank}", 
-                              PipeModule.forward, 
-                              args=(remote_out_rref, RRef(micro_labels[i]) if self.rank == 0 else y_rref))
-            else: # 倒数第二级，直接将结果发给最后一级
-                remote_inputs_rrefs.append(remote_out_rref)
-
-        # 稳定阶段 (Steady-state)
-        # 流水线已满，每个GPU同时处理不同的micro-batch
-        total_loss = 0
-        for i in range(self.micro_batches):
-            if self.rank == 0:
-                # 第一个GPU处理新的micro-batch
-                x = micro_inputs[i]
-            else:
-                # 其他GPU接收上一级的输出
-                x_rref = remote_inputs_rrefs.pop(0) if remote_inputs_rrefs else x_rref
-                self._log(f"开始 FWD (micro-batch {i}) - 接收数据")
-                x = x_rref.to_local()
-                self._log(f"完成 FWD (micro-batch {i}) - 接收数据")
-            
-            self._log(f"开始 FWD (micro-batch {i}) - 计算")
-            out = self.parts[self.rank](x)
-            self._log(f"完成 FWD (micro-batch {i}) - 计算")
-
-            if self.rank < self.world_size - 1:
-                # 不是最后一个GPU，将激活传递给下一个GPU
-                next_rank = self.rank + 1
-                self._log(f"开始 FWD (micro-batch {i}) - 发送到 GPU {next_rank}")
-                remote_out_rref = rpc.remote(f"worker{next_rank}", lambda x: x, args=(out,))
-                remote_inputs_rrefs.append(remote_out_rref)
-            else:
-                # 最后一个GPU，计算损失
-                self._log(f"开始 LOSS (micro-batch {i})")
-                loss = self.loss_fn(out, micro_labels[i])
-                total_loss += loss
-                self._log(f"完成 LOSS (micro-batch {i}), Loss: {loss.item():.4f}")
-        
-        return total_loss
-
-    def get_parameters_rrefs(self):
-        """获取模型所有参数的Remote References，用于分布式优化器。"""
-        param_rrefs = []
-        for param in self.parameters():
-            param_rrefs.append(RRef(param))
-        return param_rrefs
-
-# --- 3. 分布式工作节点 (Worker) 逻辑 ---
-def run_worker(rank, world_size, master_addr, master_port, batch_size, num_batches, micro_batches):
-    """
-    每个RPC worker进程执行的函数。
-    """
-    os.environ['MASTER_ADDR'] = master_addr
-    os.environ['MASTER_PORT'] = str(master_port)
-    
-    options = rpc.TensorPipeRpcBackendOptions(
-        num_worker_threads=16,
-        rpc_timeout=300 # 5分钟超时
-    )
-
-    # 初始化RPC
-    print(f"Rank {rank}: 正在初始化RPC...")
-    rpc.init_rpc(
-        f"worker{rank}",
-        rank=rank,
-        world_size=world_size,
-        rpc_backend_options=options
-    )
-    print(f"Rank {rank}: RPC初始化成功。")
-
-    # 获取模型切片
-    device = f'cuda:{rank}'
-    model_parts = get_resnet_split(world_size)
-    
-    # 将模型封装到PipeModule中
-    model = PipeModule(model_parts, device, micro_batches)
-    
-    # 为分布式优化器收集所有参数的RRef
-    param_rrefs = []
-    for r in range(world_size):
-        # 从每个worker获取其模型部分的参数引用
-        param_rrefs.extend(rpc.rpc_sync(f"worker{r}", model.get_parameters_rrefs))
-
-    # 创建分布式优化器
-    optimizer = DistributedOptimizer(
-        optim.Adam,
-        param_rrefs,
-        lr=0.001
-    )
-
-    # --- 训练循环 ---
-    start_train_time = time.time()
-    
-    for i in range(num_batches):
-        # 在rank 0上生成模拟数据
-        if rank == 0:
-            print("-" * 30)
-            print(f"开始 Batch {i+1}/{num_batches}")
-            # 使用分布式autograd上下文
-            with dist_autograd.context() as context_id:
-                # 准备输入数据和标签
-                inputs = torch.randn(batch_size, 3, 224, 224, device=device)
-                labels = torch.randint(0, 1000, (batch_size,), device=device)
-
-                # 将数据封装在RRef中，启动流水线
-                x_rref = RRef(inputs)
-                y_rref = RRef(labels)
-                
-                # 在最后一个rank上异步执行前向传播和loss计算
-                loss_future = rpc.rpc_async(f"worker{world_size-1}", model, args=(x_rref, y_rref))
-                
-                # 获取最终loss
-                loss = loss_future.wait()
-                
-                model._log(f"Batch {i+1} 总损失: {loss.item():.4f}")
-                model._log(f"开始 BWD (整个batch)")
-                # 执行分布式反向传播
-                dist_autograd.backward(context_id, [loss])
-                model._log(f"完成 BWD (整个batch)")
-                
-                # 执行优化器步骤
-                model._log(f"开始 Optimizer Step")
-                optimizer.step(context_id)
-                model._log(f"完成 Optimizer Step")
-
-    end_train_time = time.time()
-    total_time = end_train_time - start_train_time
-    
-    # 仅在rank 0上打印总结
-    if rank == 0:
-        throughput = (batch_size * num_batches) / total_time
-        print("\n" + "="*50)
-        print("流水线并行训练完成")
-        print("="*50)
-        print(f"  总批次数: {num_batches}")
-        print(f"  每批大小: {batch_size}")
-        print(f"  总耗时: {total_time:.2f} 秒")
-        print(f"  吞吐量: {throughput:.2f} samples/sec")
-        
-        # 收集所有GPU的峰值显存
-        mem_results = []
-        for r in range(world_size):
-            peak_mem = rpc.rpc_sync(f"worker{r}", torch.cuda.max_memory_allocated, args=(f'cuda:{r}',))
-            mem_results.append(peak_mem / 1e9) # GB
-            print(f"  GPU {r} 峰值显存: {mem_results[r]:.3f} GB")
-        
-        # 将结果保存用于对比
-        result = {
-            "mode": "Pipeline",
-            "world_size": world_size,
-            "throughput": throughput,
-            "total_time": total_time,
-            "peak_memory_gb": mem_results,
-            "status": "Success"
-        }
-        torch.save(result, "pipeline_result.pt")
-
-    # 关闭RPC
-    rpc.shutdown()
-
-# --- 4. 单机单卡基线测试 ---
-def run_single_gpu(batch_size, num_batches):
-    """
-    在单个GPU上运行完整的模型，作为性能基准。
-    """
-    print("="*50)
-    print("开始单机单卡基线测试 (on cuda:0)")
-    print("="*50)
-    
-    device = 'cuda:0'
-    result = {
-        "mode": "Single GPU",
-        "world_size": 1,
-        "throughput": 0,
-        "total_time": float('inf'),
-        "peak_memory_gb": [0],
-        "status": "Failure"
-    }
-
-    try:
-        # 加载完整模型
-        model = get_resnet_split(world_size=1)[0].to(device)
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
-        loss_fn = nn.CrossEntropyLoss()
-        
-        # 重置显存统计
-        torch.cuda.reset_peak_memory_stats(device)
-
+    def forward(self, x, stage_idx):
+        """执行指定阶段的前向传播"""
+        logger.debug(f"Stage {stage_idx} forward start")
         start_time = time.time()
-        for i in range(num_batches):
-            print(f"Batch {i+1}/{num_batches}")
-            inputs = torch.randn(batch_size, 3, 224, 224, device=device)
-            labels = torch.randint(0, 1000, (batch_size,), device=device)
-            
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = loss_fn(outputs, labels)
-            loss.backward()
-            optimizer.step()
         
-        end_time = time.time()
-        
-        total_time = end_time - start_time
-        throughput = (batch_size * num_batches) / total_time
-        peak_memory = torch.cuda.max_memory_allocated(device) / 1e9 # GB
-
-        print("\n" + "="*50)
-        print("单机单卡训练完成")
-        print("="*50)
-        print(f"  总耗时: {total_time:.2f} 秒")
-        print(f"  吞吐量: {throughput:.2f} samples/sec")
-        print(f"  GPU 0 峰值显存: {peak_memory:.3f} GB")
-
-        result.update({
-            "throughput": throughput,
-            "total_time": total_time,
-            "peak_memory_gb": [peak_memory],
-            "status": "Success"
-        })
-
-    except RuntimeError as e:
-        if "out of memory" in str(e):
-            print("\n" + "!"*50)
-            print("错误：CUDA Out of Memory! 单机单卡模式无法在当前显存下运行。")
-            print("!"*50)
-            result["status"] = "OOM"
+        if stage_idx == 0:
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = self.relu(x)
+            x = self.maxpool(x)
+        elif stage_idx == len(self.stages) - 1:
+            x = self.avgpool(x)
+            x = torch.flatten(x, 1)
+            x = self.fc(x)
         else:
-            print(f"\n发生未知运行时错误: {e}")
-            result["status"] = f"Error: {e}"
+            x = self.stages[stage_idx - 1](x)
+        
+        elapsed = time.time() - start_time
+        logger.debug(f"Stage {stage_idx} forward end ({elapsed:.4f}s)")
+        return x
+
+# 流水线并行训练器
+class PipelineTrainer:
+    def __init__(self, model, device_ids, num_microbatches=8):
+        self.model = model
+        self.device_ids = device_ids
+        self.num_stages = len(device_ids)
+        self.num_microbatches = num_microbatches
+        self.stage_times = [[] for _ in range(self.num_stages)]
+        self.comm_times = []
+        
+        # 将每个阶段分配到不同设备
+        self.stage_devices = [torch.device(f'cuda:{gpu_id}') for gpu_id in device_ids]
+        for i, device in enumerate(self.stage_devices):
+            self.model.stages[i] = self.model.stages[i].to(device)
+            
+    def train_step(self, data, target):
+        # 将batch拆分为微批次
+        microbatch_size = data.size(0) // self.num_microbatches
+        losses = []
+        
+        # 流水线执行
+        for mb_idx in range(self.num_microbatches + self.num_stages - 1):
+            stage_idx = mb_idx % self.num_stages
+            real_mb_idx = mb_idx - stage_idx
+            
+            # 执行前向传播
+            if 0 <= real_mb_idx < self.num_microbatches:
+                # 准备数据
+                start_idx = real_mb_idx * microbatch_size
+                end_idx = start_idx + microbatch_size
+                mb_data = data[start_idx:end_idx]
+                mb_target = target[start_idx:end_idx]
+                
+                # 移动到当前阶段设备
+                if stage_idx == 0:
+                    current_input = mb_data.to(self.stage_devices[0])
+                else:
+                    # 从前一阶段获取输入
+                    comm_start = time.time()
+                    current_input = current_output.to(self.stage_devices[stage_idx])
+                    comm_time = time.time() - comm_start
+                    self.comm_times.append(comm_time)
+                    logger.debug(f"Stage {stage_idx} comm time: {comm_time:.4f}s")
+                
+                # 执行当前阶段计算
+                stage_start = time.time()
+                current_output = self.model(current_input, stage_idx)
+                stage_time = time.time() - stage_start
+                self.stage_times[stage_idx].append(stage_time)
+                
+                # 最后一个阶段计算损失
+                if stage_idx == self.num_stages - 1:
+                    loss = nn.functional.cross_entropy(current_output, mb_target.to(self.stage_devices[-1]))
+                    losses.append(loss)
+        
+        # 聚合损失并执行反向传播
+        if losses:
+            total_loss = sum(losses) / len(losses)
+            total_loss.backward()
+            return total_loss.item()
+        return 0.0
+
+# 单机单卡训练器
+class SingleGPUTrainer:
+    def __init__(self, model, device_id=0):
+        self.device = torch.device(f'cuda:{device_id}')
+        self.model = model.to(self.device)
+        self.times = []
+        
+    def train_step(self, data, target):
+        start_time = time.time()
+        data, target = data.to(self.device), target.to(self.device)
+        output = self.model(data, 0)  # stage_idx=0 表示完整模型
+        loss = nn.functional.cross_entropy(output, target)
+        loss.backward()
+        step_time = time.time() - start_time
+        self.times.append(step_time)
+        return loss.item()
+
+# 创建ResNet模型
+def create_resnet(pretrained=False):
+    model = ResNet(BasicBlock, [2, 2, 2, 2])
+    # 拆分模型为多个阶段
+    stages = nn.ModuleList([
+        nn.Sequential(model.layer1),
+        nn.Sequential(model.layer2),
+        nn.Sequential(model.layer3),
+        nn.Sequential(model.layer4)
+    ])
+    return PipelineResNet(stages, BasicBlock, [2, 2, 2, 2])
+
+# 训练函数
+def train(rank, world_size, args):
+    # 初始化分布式环境
+    os.environ['MASTER_ADDR'] = args.master_addr
+    os.environ['MASTER_PORT'] = args.master_port
+    dist.init_process_group('nccl', rank=rank, world_size=world_size)
     
-    finally:
-        torch.save(result, "single_gpu_result.pt")
+    # 创建模型和数据
+    torch.cuda.set_device(rank)
+    model = create_resnet()
+    dataset = SyntheticDataset()
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler)
+    
+    # 创建不同的训练器
+    if args.mode == 'pipeline':
+        device_ids = list(range(world_size))
+        trainer = PipelineTrainer(model, device_ids, num_microbatches=8)
+    else:  # single-gpu
+        trainer = SingleGPUTrainer(model, rank)
+    
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    
+    # 训练循环
+    for epoch in range(args.epochs):
+        sampler.set_epoch(epoch)
+        for i, (data, target) in enumerate(dataloader):
+            optimizer.zero_grad()
+            loss = trainer.train_step(data, target)
+            optimizer.step()
+            
+            if i % 10 == 0:
+                logger.info(f"Rank {rank} Epoch {epoch} Step {i} Loss: {loss:.4f}")
+    
+    # 收集时间统计信息
+    if args.mode == 'pipeline' and rank == 0:
+        return {
+            'stage_times': trainer.stage_times,
+            'comm_times': trainer.comm_times
+        }
+    elif args.mode == 'single':
+        return {'step_times': trainer.times}
+    return {}
 
+# 可视化结果
+def visualize_results(pipeline_results, single_results):
+    plt.figure(figsize=(15, 10))
+    
+    # 流水线各阶段计算时间
+    plt.subplot(2, 2, 1)
+    for i, times in enumerate(pipeline_results['stage_times']):
+        plt.plot(times, label=f'Stage {i}')
+    plt.title('Pipeline Stage Computation Times')
+    plt.xlabel('Microbatch Index')
+    plt.ylabel('Time (s)')
+    plt.legend()
+    
+    # 通信时间分布
+    plt.subplot(2, 2, 2)
+    plt.hist(pipeline_results['comm_times'], bins=50)
+    plt.title('Communication Time Distribution')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Frequency')
+    
+    # 单卡训练时间
+    plt.subplot(2, 2, 3)
+    plt.plot(single_results['step_times'])
+    plt.title('Single GPU Step Times')
+    plt.xlabel('Step')
+    plt.ylabel('Time (s)')
+    
+    # 效率对比
+    plt.subplot(2, 2, 4)
+    avg_pipeline_time = np.mean([t for stage in pipeline_results['stage_times'] for t in stage])
+    avg_single_time = np.mean(single_results['step_times'])
+    comm_percentage = 100 * np.mean(pipeline_results['comm_times']) / avg_pipeline_time
+    
+    labels = ['Single GPU', f'Pipeline ({len(pipeline_results["stage_times"])} stages)']
+    times = [avg_single_time, avg_pipeline_time]
+    
+    plt.bar(labels, times, color=['blue', 'orange'])
+    plt.title('Average Step Time Comparison')
+    plt.ylabel('Time (s)')
+    plt.text(1, avg_pipeline_time/2, f'Comm: {comm_percentage:.1f}%', ha='center', color='white')
+    
+    plt.tight_layout()
+    plt.savefig('pipeline_vs_single.png')
+    plt.show()
 
-# --- 5. 主函数和对比可视化 ---
+# 主函数
 def main():
-    parser = argparse.ArgumentParser(description="PyTorch流水线并行Demo")
-    parser.add_argument("--mode", type=str, default="pipeline", choices=["pipeline", "single", "compare"],
-                        help="运行模式: 'pipeline' (分布式), 'single' (单卡基准), 'compare' (比较结果)")
-    parser.add_argument("--rank", type=int, default=0, help="当前节点的rank")
-    parser.add_argument("--world_size", type=int, default=4, help="总节点/GPU数量")
-    parser.add_argument("--master_addr", type=str, default="localhost", help="主节点地址")
-    parser.add_argument("--master_port", type=int, default=29500, help="主节点端口")
-    parser.add_argument("--batch_size", type=int, default=256, help="总batch size")
-    parser.add_argument("--num_batches", type=int, default=10, help="训练的batch数量")
-    parser.add_argument("--micro_batches", type=int, default=8, help="流水线中的micro-batch数量")
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['pipeline', 'single'], default='pipeline',
+                       help='Training mode: pipeline or single GPU')
+    parser.add_argument('--batch-size', type=int, default=64,
+                       help='Input batch size')
+    parser.add_argument('--epochs', type=int, default=3,
+                       help='Number of epochs to train')
+    parser.add_argument('--master-addr', default='localhost',
+                       help='Master address for distributed training')
+    parser.add_argument('--master-port', default='29500',
+                       help='Master port for distributed training')
+    parser.add_argument('--nodes', type=int, default=1,
+                       help='Number of nodes')
+    parser.add_argument('--gpus', type=int, default=4,
+                       help='Number of GPUs per node')
     args = parser.parse_args()
 
-    if args.mode == "pipeline":
-        if not torch.cuda.is_available() or torch.cuda.device_count() < args.world_size:
-            if args.rank == 0:
-                print(f"错误：需要 {args.world_size} 个GPU，但只检测到 {torch.cuda.device_count()} 个。")
-            return
-        run_worker(args.rank, args.world_size, args.master_addr, args.master_port, 
-                   args.batch_size, args.num_batches, args.micro_batches)
-    elif args.mode == "single":
-        if not torch.cuda.is_available():
-            print("错误：此模式需要至少一个GPU。")
-            return
-        run_single_gpu(args.batch_size, args.num_batches)
-    elif args.mode == "compare":
-        # 加载两个模式的运行结果并打印对比表格
-        try:
-            pipeline_res = torch.load("pipeline_result.pt")
-            single_res = torch.load("single_gpu_result.pt")
-            
-            print("\n" + "="*80)
-            print(" " * 30 + "性能对比报告")
-            print("="*80)
-            print("| 配置 (模式 | GPU数量) | 状态    | 吞吐量 (samples/sec) | 总耗时 (s) | 峰值显存 (GB)            |")
-            print("|--------------------------|---------|------------------------|--------------|--------------------------|")
-            
-            # 单卡结果
-            status_s = single_res['status']
-            tp_s = f"{single_res['throughput']:.2f}" if status_s == 'Success' else 'N/A'
-            time_s = f"{single_res['total_time']:.2f}" if status_s == 'Success' else 'N/A'
-            mem_s = f"GPU0: {single_res['peak_memory_gb'][0]:.3f}" if status_s == 'Success' else 'N/A'
-            print(f"| Single GPU (1 卡)        | {status_s:<7} | {tp_s:<22} | {time_s:<12} | {mem_s:<24} |")
+    world_size = args.nodes * args.gpus
+    
+    # 运行分布式训练
+    if args.mode == 'pipeline':
+        mp.spawn(train, args=(world_size, args), nprocs=world_size, join=True)
+    else:
+        # 单机单卡模式
+        results = train(0, 1, args)
+        print(f"Single GPU average step time: {np.mean(results['step_times']):.4f}s")
 
-            # 流水线结果
-            status_p = pipeline_res['status']
-            tp_p = f"{pipeline_res['throughput']:.2f}" if status_p == 'Success' else 'N/A'
-            time_p = f"{pipeline_res['total_time']:.2f}" if status_p == 'Success' else 'N/A'
-            mem_list = [f"GPU{i}: {m:.3f}" for i, m in enumerate(pipeline_res['peak_memory_gb'])]
-            mem_p = ', '.join(mem_list)
-            print(f"| Pipeline ({pipeline_res['world_size']} 卡)       | {status_p:<7} | {tp_p:<22} | {time_p:<12} | {mem_p:<24} |")
-            print("-" * 80)
+# 运行对比实验
+def run_comparison():
+    # 运行流水线并行
+    print("Running pipeline training...")
+    pipeline_args = argparse.Namespace(
+        mode='pipeline',
+        batch_size=32,
+        epochs=2,
+        master_addr='localhost',
+        master_port='29500',
+        nodes=1,
+        gpus=4
+    )
+    pipeline_results = train(0, 4, pipeline_args)  # 假设在rank0收集结果
+    
+    # 运行单机单卡
+    print("Running single GPU training...")
+    single_args = argparse.Namespace(
+        mode='single',
+        batch_size=32,
+        epochs=2,
+        master_addr='localhost',
+        master_port='29500',
+        nodes=1,
+        gpus=1
+    )
+    try:
+        single_results = train(0, 1, single_args)
+    except RuntimeError as e:
+        if 'out of memory' in str(e).lower():
+            print("Single GPU OOM detected! Using smaller batch size")
+            single_args.batch_size = 16
+            single_results = train(0, 1, single_args)
+        else:
+            raise
+    
+    # 可视化结果
+    visualize_results(pipeline_results, single_results)
 
-        except FileNotFoundError:
-            print("\n错误：找不到结果文件 'pipeline_result.pt' 或 'single_gpu_result.pt'。")
-            print("请先分别以 'pipeline' 和 'single' 模式运行脚本。")
-            print("例如: python your_script.py --mode single")
-            print("然后(在多个终端中): python your_script.py --mode pipeline --rank ...")
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    # 直接运行对比实验
+    run_comparison()
