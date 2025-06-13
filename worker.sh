@@ -11,6 +11,5 @@ torchrun \
   --master_addr 192.168.1.73 \
   --master_port 29500 \
   resnet_pipeline.py \
-  --mode pipeline \
   --epochs 10 \
   --batch 128 \
