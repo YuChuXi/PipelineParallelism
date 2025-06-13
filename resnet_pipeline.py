@@ -73,7 +73,6 @@ class Driver:
     def train_epoch(self, loader, rank):
         totl, tot = 0.0, 0
         for step, (x, y) in enumerate(loader):
-            xs = y = None  # silence linter
             xs, ys = x.chunk(self.micro), y.chunk(self.micro)
             with dist_autograd.context() as ctx:
                 outs = self._push_batch(list(xs), list(ys))
