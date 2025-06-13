@@ -231,3 +231,21 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+# ---- 多机多卡启动示例（2 节点 × 1 GPU）----
+# 节点 A（master）：
+MASTER_ADDR=<master_ip>
+MASTER_PORT=29500
+torchrun --nnodes=2 --nproc_per_node=1 --node_rank=0 \
+    resnet_pipeline.py --mode pipeline --epochs 5 --batch 128 --chunks 4
+
+# 节点 B（worker）：
+MASTER_ADDR=<master_ip>
+MASTER_PORT=29500
+torchrun --nnodes=2 --nproc_per_node=1 --node_rank=1 \
+    resnet_pipeline.py --mode pipeline --epochs 5 --batch 128 --chunks 4
+
+# ---- 单机单卡基准 ----
+python resnet_pipeline.py --mode single --epochs 5 --batch 128
+"""
