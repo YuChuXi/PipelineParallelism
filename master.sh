@@ -15,4 +15,3 @@ torchrun \
   --epochs 10 \
   --batch 128 \
   --chunks 4 \
-    --single_time 37.79
