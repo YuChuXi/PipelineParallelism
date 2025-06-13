@@ -51,7 +51,7 @@ class Driver:
         # --- 1. 先把所有 micro 送入 stage-0 ---
         futs0 = []
         for mb in xs:
-            futs0.append(self.stg0.rpc_async().forward(mb))
+            futs0.append(self.stg0.rpc_async().forward(mb.cpu()))
 
         # --- 2. 主线程轮询 stage-0 的完成事件，完成一个就送 stage-1 ---
         outs = []
